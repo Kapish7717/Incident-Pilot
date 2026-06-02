@@ -51,31 +51,7 @@ Welcome to the **Autonomous AI-Agentic SRE Incident Response System**! This is a
 
 ---
 
-## 📂 Project Structure
 
-```text
-├── data/
-│   └── deploy_history.json       # Git deployment history database ledger
-├── demo_app/
-│   ├── __init__.py
-│   ├── app.py                    # Main FastAPI service routes & webhook handlers
-│   ├── check_db.py               # DB verification utility tool (highly optimized)
-│   ├── database.py               # SQLite / SQLAlchemy connection setups
-│   ├── metrics.py                # Prometheus metrics declarations (counters, histograms, gauges)
-│   └── models.py                 # SQLAlchemy database schema models
-├── runbooks/                     # SRE Standard Operating Procedures (SOPs)
-│   ├── cpu_spike.md              # CPU threshold response guidelines
-│   ├── db_failure.md             # DB connection failure rules
-│   ├── generic_error.md          # Fallback generic SRE rules
-│   ├── latency_spike.md          # Response latency guidelines
-│   └── memory_leak.md            # RAM leak response guidelines
-├── incidents.db                  # Local SQLite physical database (auto-generated)
-├── llm.py                        # Reusable Agentic AI SRE Analysis API Library
-├── requirements.txt              # Project dependency configurations
-└── README.md                     # This file!
-```
-
----
 
 ## 🛠️ Key Features Built & Completed
 
