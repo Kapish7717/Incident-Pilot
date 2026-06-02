@@ -1,0 +1,37 @@
+groups:
+  - name: demo-alerts
+
+    rules:
+
+      - alert: HighRequestTraffic
+        expr: request_count_total > 20
+        for: 5s
+
+      - alert: HighErrorRate
+        expr: error_count_total > 5
+        for: 5s
+
+      - alert: HighLatency
+        expr: histogram_quantile(0.95, rate(request_latency_seconds_bucket[1m])) > 5
+
+      - alert: HighCPUUsage
+        expr: cpu_usage_percent > 80
+
+      - alert: HighMemoryUsage
+        expr: memory_usage_bytes > 100000000
+
+      - alert: HighDBConnectionFailures
+        expr: db_connection_failures_total > 3
+        for: 5s
+
+      - alert: HighLLMTimeouts
+        expr: llm_timeout_total > 3
+        for: 5s
+
+      - alert: HighRAGRetrievalFailures
+        expr: rag_retrieval_failures_total > 3
+        for: 5s
+
+      - alert: HighExternalAPIFailures
+        expr: external_api_failures_total > 3
+        for: 5s

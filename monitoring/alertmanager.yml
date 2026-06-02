@@ -1,0 +1,7 @@
+route:
+  receiver: "fastapi-webhook"
+
+receivers:
+  - name: "fastapi-webhook"
+    webhook_configs:
+      - url: "http://127.0.0.1:8000/alerts"
