@@ -71,9 +71,6 @@ Welcome to the **Autonomous AI-Agentic SRE Incident Response System**! This is a
 │   └── memory_leak.md            # RAM leak response guidelines
 ├── incidents.db                  # Local SQLite physical database (auto-generated)
 ├── llm.py                        # Reusable Agentic AI SRE Analysis API Library
-├── test_groq.py                  # Self-contained SRE reasoning validation test script
-├── project_summary.txt           # Architectural explainer document for operators
-├── routing_and_hitl_guide.txt    # Dynamic Routing & Human-in-the-Loop guide
 ├── requirements.txt              # Project dependency configurations
 └── README.md                     # This file!
 ```
