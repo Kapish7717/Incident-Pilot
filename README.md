@@ -136,6 +136,4 @@ To test the Prometheus Alert webhook ingestion pathway manually:
 
 ---
 
-## 🧠 Advanced AI Agent Design: Routing & HITL
-For a deep architectural explanation of the dynamic AI branching mechanisms (Routing to diagnostics on low confidence, pausing and enqueuing risky actions for operator manual review), refer to the conceptual guide:
-👉 **[routing_and_hitl_guide.txt](file:///c:/Kapish/IncidentAgent/routing_and_hitl_guide.txt)**
+
