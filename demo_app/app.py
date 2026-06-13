@@ -10,7 +10,7 @@ import os
 
 from demo_app.metrics import *
 from demo_app.database import engine, Base, SessionLocal
-from demo_app.models import Incident, IncidentTimeline
+from demo_app.models import Incident, IncidentTimeline, RemediationAction
 
 # Initialize database tables
 Base.metadata.create_all(bind=engine)
@@ -125,21 +125,18 @@ def collect_and_analyze(incident_id: str):
                 "recent_deployments": matching_deploys
             }
             incident.system_metrics = json.dumps(system_snapshot)
-            incident.status = "analyzed"
             
-            # 5. Log timeline audit trail
+            # Log timeline audit trail for context collection
             db.add(IncidentTimeline(
                 incident_id=incident.id,
                 event_type="context_collected",
                 description=f"Prometheus metrics, CPU/Memory stats, and {len(matching_deploys)} recent deployments collected successfully."
             ))
-            db.add(IncidentTimeline(
-                incident_id=incident.id,
-                event_type="analysis_complete",
-                description=f"Incident '{incident.alert_name}' successfully analyzed. Telemetry + deploy snapshots captured in SQLite."
-            ))
             db.commit()
-            print(f"[Background Task] Successfully analyzed incident {incident_id}.")
+            print(f"[Background Task] Successfully collected context for incident {incident_id}. Handing off to Agent...")
+            
+            from agent import run_agent_on_incident
+            run_agent_on_incident(incident_id)
             
     except Exception as e:
         db.rollback()
@@ -327,3 +324,102 @@ async def alerts(request: Request, background_tasks: BackgroundTasks):
         db.close()
         
     return {"status": "processed", "alerts_count": len(alerts_list)}
+
+# ----------------------------
+# Operator Portal & Incident endpoints
+# ----------------------------
+
+@app.get("/incidents")
+def list_incidents():
+    db = SessionLocal()
+    try:
+        incidents = db.query(Incident).order_by(Incident.starts_at.desc()).all()
+        return [
+            {
+                "id": inc.id,
+                "alert_name": inc.alert_name,
+                "status": inc.status,
+                "severity": inc.severity,
+                "starts_at": inc.starts_at.isoformat() if inc.starts_at else None,
+                "ends_at": inc.ends_at.isoformat() if inc.ends_at else None
+            }
+            for inc in incidents
+        ]
+    finally:
+        db.close()
+
+@app.get("/incidents/{incident_id}")
+def get_incident_details(incident_id: str):
+    db = SessionLocal()
+    try:
+        inc = db.query(Incident).filter(Incident.id == incident_id).first()
+        if not inc:
+            return {"error": "Incident not found"}
+        
+        return {
+            "id": inc.id,
+            "alert_name": inc.alert_name,
+            "status": inc.status,
+            "severity": inc.severity,
+            "starts_at": inc.starts_at.isoformat() if inc.starts_at else None,
+            "ends_at": inc.ends_at.isoformat() if inc.ends_at else None,
+            "metrics_snapshot": json.loads(inc.metrics_snapshot) if inc.metrics_snapshot else {},
+            "system_metrics": json.loads(inc.system_metrics) if inc.system_metrics else {},
+            "analysis_summary": inc.analysis_summary,
+            "timeline": [
+                {
+                    "timestamp": t.timestamp.isoformat(),
+                    "event_type": t.event_type,
+                    "description": t.description
+                }
+                for t in sorted(inc.timeline, key=lambda x: x.timestamp)
+            ],
+            "actions": [
+                {
+                    "id": a.id,
+                    "action_type": a.action_type,
+                    "risk_level": a.risk_level,
+                    "status": a.status,
+                    "details": a.details,
+                    "execution_output": a.execution_output
+                }
+                for a in inc.actions
+            ]
+        }
+    finally:
+        db.close()
+
+@app.post("/incidents/{incident_id}/approve/{action_id}")
+async def approve_incident_action(incident_id: str, action_id: str, background_tasks: BackgroundTasks):
+    db = SessionLocal()
+    try:
+        action = db.query(RemediationAction).filter(
+            RemediationAction.incident_id == incident_id,
+            RemediationAction.id == action_id
+        ).first()
+        
+        if not action:
+            return {"error": "Proposed action not found"}
+            
+        if action.status == "pending_approval":
+            # 1. Update action state to approved
+            action.status = "approved"
+            
+            # 2. Add Timeline event
+            db.add(IncidentTimeline(
+                incident_id=incident_id,
+                event_type="action_approved",
+                description=f"Operator approved execution of action: '{action.action_type}'"
+            ))
+            db.commit()
+            
+            # 3. Resume and execute the sensitive operation asynchronously
+            from agent import execute_sensitive_remediation
+            background_tasks.add_task(execute_sensitive_remediation, action.id)
+            
+            return {"status": "success", "message": f"Action '{action.action_type}' approved and dispatched."}
+        else:
+            return {"status": "ignored", "message": f"Action status is '{action.status}', not 'pending_approval'."}
+            
+    finally:
+        db.close()

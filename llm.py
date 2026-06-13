@@ -27,16 +27,31 @@ def analyze_incident_telemetry(alert_details: dict, metrics_snapshot: dict, syst
     
     Returns a dictionary matching the schema:
     {
+      "confidence_score": 85,
+      "missing_context_details": "...",
       "root_cause_analysis": "...",
       "proposed_actions": [
          {"action_type": "...", "risk_level": "...", "status": "...", "details": "..."}
       ]
     }
     """
+    if not os.getenv("GROQ_API_KEY") and os.path.exists(".env"):
+        try:
+            with open(".env", "r") as f:
+                for line in f:
+                    if "=" in line:
+                        k, v = line.split("=", 1)
+                        if k.strip() == "GROQ_API_KEY":
+                            os.environ["GROQ_API_KEY"] = v.strip().strip("'").strip('"')
+        except Exception as e:
+            print(f"[WARNING] Failed to load .env file: {e}")
+
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
         print("[WARNING] GROQ_API_KEY is not set in environment variables.")
         return {
+            "confidence_score": 0,
+            "missing_context_details": "GROQ_API_KEY environment variable is missing.",
             "root_cause_analysis": "GROQ_API_KEY not configured. Automated AI Agentic analysis skipped.",
             "proposed_actions": []
         }
@@ -66,10 +81,12 @@ Started At: {alert_details.get('starts_at', 'unknown')}
 
 ---
 CRITICAL REQUIREMENT:
-You must perform a detailed root-cause analysis correlating the alert telemetry with the recent deployment changes, and then output a structured remediation plan.
+You must perform a detailed root-cause analysis correlating the alert telemetry with the recent deployment changes, assess your confidence score, identify any missing context, and then output a structured remediation plan.
 Your response MUST be a single, valid JSON object ONLY. Do not include any conversational text, explanations outside the JSON, or markdown blocks. The JSON must exactly match the schema below:
 
 {{
+  "confidence_score": 85,
+  "missing_context_details": "Explanation of any missing or incomplete telemetry/deployment logs, or empty string if all context is complete.",
   "root_cause_analysis": "Clear explanation of what caused the alert based on the telemetry and recent deployments.",
   "proposed_actions": [
     {{
@@ -108,6 +125,8 @@ Your response MUST be a single, valid JSON object ONLY. Do not include any conve
     except Exception as e:
         print(f"[Agentic AI] [ERROR] Failed to execute LLM analysis: {e}")
         return {
+            "confidence_score": 0,
+            "missing_context_details": f"Error running analysis: {str(e)}",
             "root_cause_analysis": f"AI Agent analysis failed with error: {str(e)}",
             "proposed_actions": []
         }
