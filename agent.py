@@ -4,6 +4,302 @@ from demo_app.metrics import MEMORY_USAGE, CPU_USAGE
 import json
 import os
 from datetime import datetime
+from typing import TypedDict, List, Dict, Any
+from langgraph.graph import StateGraph, START, END
+
+# Define LangGraph State
+class IncidentGraphState(TypedDict):
+    incident_id: str
+    alert_name: str
+    severity: str
+    starts_at: str
+    metrics_snapshot: Dict[str, Any]
+    system_metrics: Dict[str, Any]
+    analysis_summary: str
+    confidence_score: int
+    missing_context_details: str
+    proposed_actions: List[Dict[str, Any]]
+    db_status: str
+
+# ----------------------------------------------------
+# 1. GRAPH NODES IMPLEMENTATION
+# ----------------------------------------------------
+
+def collect_context_node(state: IncidentGraphState) -> Dict[str, Any]:
+    """Node: Retrieves latest collected telemetry context from the DB."""
+    db = SessionLocal()
+    try:
+        incident = db.query(Incident).filter(Incident.id == state["incident_id"]).first()
+        if not incident:
+            raise ValueError(f"Incident {state['incident_id']} not found.")
+        
+        metrics_snap = json.loads(incident.metrics_snapshot) if incident.metrics_snapshot else {}
+        sys_metrics = json.loads(incident.system_metrics) if incident.system_metrics else {}
+        
+        print(f"[Graph Node] Context Collection completed for incident: {incident.id}")
+        return {
+            "alert_name": incident.alert_name,
+            "severity": incident.severity,
+            "starts_at": incident.starts_at.isoformat() if incident.starts_at else "unknown",
+            "metrics_snapshot": metrics_snap,
+            "system_metrics": sys_metrics,
+            "db_status": incident.status
+        }
+    finally:
+        db.close()
+
+def llm_analysis_node(state: IncidentGraphState) -> Dict[str, Any]:
+    """Node: Runs LLM model to perform root-cause analysis and generate action plan."""
+    from llm import analyze_incident_telemetry
+    
+    db = SessionLocal()
+    try:
+        incident = db.query(Incident).filter(Incident.id == state["incident_id"]).first()
+        if incident:
+            incident.status = "analyzing"
+            db.commit()
+            
+        alert_details = {
+            "alert_name": state["alert_name"],
+            "severity": state["severity"],
+            "starts_at": state["starts_at"]
+        }
+        
+        print(f"[Graph Node] LLM Agent reasoning running for alert: '{state['alert_name']}'...")
+        plan = analyze_incident_telemetry(alert_details, state["metrics_snapshot"], state["system_metrics"])
+        
+        analysis_summary = plan.get("root_cause_analysis", "")
+        confidence = plan.get("confidence_score", 100)
+        missing_details = plan.get("missing_context_details", "")
+        proposed = plan.get("proposed_actions", [])
+        
+        if incident:
+            incident.analysis_summary = analysis_summary
+            db.add(IncidentTimeline(
+                incident_id=incident.id,
+                event_type="analysis_complete",
+                description=f"AI Agentic analysis completed. Root cause: {analysis_summary[:100]}..."
+            ))
+            db.commit()
+            
+        return {
+            "analysis_summary": analysis_summary,
+            "confidence_score": confidence,
+            "missing_context_details": missing_details,
+            "proposed_actions": proposed,
+            "db_status": "analyzing"
+        }
+    except Exception as e:
+        print(f"[Graph Node] [ERROR] in llm_analysis_node: {e}")
+        return {
+            "analysis_summary": f"Agent reasoning failed: {e}",
+            "confidence_score": 0,
+            "missing_context_details": str(e),
+            "proposed_actions": []
+        }
+    finally:
+        db.close()
+
+def manual_diagnosis_node(state: IncidentGraphState) -> Dict[str, Any]:
+    """Node: Routes the incident to manual diagnostic queue due to low confidence/missing context."""
+    db = SessionLocal()
+    try:
+        incident = db.query(Incident).filter(Incident.id == state["incident_id"]).first()
+        if incident:
+            incident.status = "needs_manual_diagnosis"
+            db.add(IncidentTimeline(
+                incident_id=incident.id,
+                event_type="routed_to_diagnostic",
+                description=(
+                    f"Confidence: {state['confidence_score']}%. "
+                    f"Missing context: {state['missing_context_details'] or 'No deployments found.'} "
+                    f"Routed to SRE diagnostic queue."
+                )
+            ))
+            db.commit()
+            print(f"[Graph Node] Escalating: Incident {state['incident_id']} routed to SRE diagnostic queue.")
+        return {"db_status": "needs_manual_diagnosis"}
+    except Exception as e:
+        db.rollback()
+        print(f"[Graph Node] [ERROR] in manual_diagnosis_node: {e}")
+        return {}
+    finally:
+        db.close()
+
+def remediation_node(state: IncidentGraphState) -> Dict[str, Any]:
+    """Node: Auto-executes safe remediation actions and stages risky actions for HITL approval."""
+    db = SessionLocal()
+    try:
+        incident = db.query(Incident).filter(Incident.id == state["incident_id"]).first()
+        if not incident:
+            return {}
+            
+        incident.status = "analyzed"
+        db.commit()
+        
+        proposed_actions = state["proposed_actions"]
+        has_risky_actions = False
+        
+        for action in proposed_actions:
+            action_type = action.get("action_type", "unknown")
+            risk_level = action.get("risk_level", "safe")
+            details = action.get("details", "")
+            
+            db_action = RemediationAction(
+                incident_id=incident.id,
+                action_type=action_type,
+                risk_level=risk_level,
+                details=details
+            )
+            
+            if risk_level == "safe":
+                # Executing Safe Action
+                db_action.status = "executing"
+                db.add(db_action)
+                db.commit()
+                
+                db.add(IncidentTimeline(
+                    incident_id=incident.id,
+                    event_type="action_proposed",
+                    description=f"Proposed safe action '{action_type}': {details}"
+                ))
+                db.commit()
+                
+                output = run_mock_remediation(action_type)
+                db_action.execution_output = output
+                db_action.status = "executed"
+                
+                db.add(IncidentTimeline(
+                    incident_id=incident.id,
+                    event_type="action_executed",
+                    description=f"Auto-executed safe remediation action: '{action_type}'"
+                ))
+                db.commit()
+            else:
+                # Staging Risky Action
+                has_risky_actions = True
+                db_action.status = "pending_approval"
+                db.add(db_action)
+                db.commit()
+                
+                db.add(IncidentTimeline(
+                    incident_id=incident.id,
+                    event_type="action_proposed",
+                    description=f"Proposed risky action '{action_type}' (requires SRE approval): {details}"
+                ))
+                db.commit()
+                
+        if has_risky_actions:
+            incident.status = "awaiting_approval"
+            db.add(IncidentTimeline(
+                incident_id=incident.id,
+                event_type="awaiting_operator_approval",
+                description="One or more risky remediation actions require manual Operator approval."
+            ))
+            db.commit()
+            print(f"[Graph Node] Incident {incident.id} transitioned to awaiting operator approval.")
+            return {"db_status": "awaiting_approval"}
+        else:
+            print(f"[Graph Node] Only safe actions proposed/executed for incident {incident.id}.")
+            return {"db_status": "resolved"}
+    except Exception as e:
+        db.rollback()
+        print(f"[Graph Node] [ERROR] in remediation_node: {e}")
+        return {}
+    finally:
+        db.close()
+
+def resolve_and_postmortem_node(state: IncidentGraphState) -> Dict[str, Any]:
+    """Node: Closes the lifecycle loop, resolves the incident, and generates the postmortem report."""
+    db = SessionLocal()
+    try:
+        incident = db.query(Incident).filter(Incident.id == state["incident_id"]).first()
+        if incident:
+            incident.status = "resolved"
+            incident.ends_at = datetime.utcnow()
+            db.add(IncidentTimeline(
+                incident_id=incident.id,
+                event_type="resolved",
+                description="Incident resolved successfully after executing remediation actions."
+            ))
+            db.commit()
+            print(f"[Graph Node] Incident {incident.id} marked as resolved. Creating postmortem report...")
+            generate_postmortem(incident.id)
+        return {"db_status": "resolved"}
+    except Exception as e:
+        db.rollback()
+        print(f"[Graph Node] [ERROR] in resolve_and_postmortem_node: {e}")
+        return {}
+    finally:
+        db.close()
+
+# ----------------------------------------------------
+# 2. CONDITIONAL EDGES / ROUTING LOGIC
+# ----------------------------------------------------
+
+def routing_decider(state: IncidentGraphState) -> str:
+    """Checks confidence score and recent deployment logs for meta-cognition routing."""
+    confidence = state.get("confidence_score", 100)
+    sys_metrics = state.get("system_metrics", {})
+    recent_deploys = sys_metrics.get("recent_deployments", [])
+    
+    if confidence < 80 or not recent_deploys:
+        return "manual_diagnosis"
+    else:
+        return "remediation"
+
+def risk_decider(state: IncidentGraphState) -> str:
+    """Branches output based on whether any risky actions were enqueued."""
+    if state.get("db_status") == "awaiting_approval":
+        return "await_approval"
+    else:
+        return "resolve_and_postmortem"
+
+# ----------------------------------------------------
+# 3. COMPILE LANGGRAPH STATEGRAPH
+# ----------------------------------------------------
+
+workflow = StateGraph(IncidentGraphState)
+
+# Add Nodes
+workflow.add_node("collect_context", collect_context_node)
+workflow.add_node("llm_analysis", llm_analysis_node)
+workflow.add_node("manual_diagnosis", manual_diagnosis_node)
+workflow.add_node("remediation", remediation_node)
+workflow.add_node("resolve_and_postmortem", resolve_and_postmortem_node)
+
+# Set Node Edges
+workflow.add_edge(START, "collect_context")
+workflow.add_edge("collect_context", "llm_analysis")
+
+# Set Conditional Routing Edges
+workflow.add_conditional_edges(
+    "llm_analysis",
+    routing_decider,
+    {
+        "manual_diagnosis": "manual_diagnosis",
+        "remediation": "remediation"
+    }
+)
+
+workflow.add_edge("manual_diagnosis", END)
+
+workflow.add_conditional_edges(
+    "remediation",
+    risk_decider,
+    {
+        "await_approval": END,
+        "resolve_and_postmortem": "resolve_and_postmortem"
+    }
+)
+
+workflow.add_edge("resolve_and_postmortem", END)
+
+compiled_graph = workflow.compile()
+
+# ----------------------------------------------------
+# 4. EXPOSED UTILITY & CORE FUNCTIONS
+# ----------------------------------------------------
 
 def build_agent_input(incident_id: str) -> dict:
     db = SessionLocal()
@@ -36,168 +332,37 @@ def build_agent_input(incident_id: str) -> dict:
         db.close()
 
 def run_agent_on_incident(incident_id: str):
-    from llm import analyze_incident_telemetry
-    
-    db = SessionLocal()
+    """Executes the SRE Agent StateGraph for the given incident."""
+    initial_state = {
+        "incident_id": incident_id,
+        "alert_name": "",
+        "severity": "",
+        "starts_at": "",
+        "metrics_snapshot": {},
+        "system_metrics": {},
+        "analysis_summary": "",
+        "confidence_score": 100,
+        "missing_context_details": "",
+        "proposed_actions": [],
+        "db_status": ""
+    }
+    print(f"[Agent Graph] Invoking LangGraph workflow execution for incident {incident_id}...")
     try:
-        incident = db.query(Incident).filter(Incident.id == incident_id).first()
-        if not incident:
-            print(f"[Agent] Incident {incident_id} not found in DB.")
-            return
-        
-        # 1. Update status to analyzing
-        incident.status = "analyzing"
-        db.commit()
-        
-        # 2. Build details dict
-        alert_details = {
-            "alert_name": incident.alert_name,
-            "severity": incident.severity,
-            "starts_at": incident.starts_at.isoformat() if incident.starts_at else "unknown"
-        }
-        
-        metrics_snapshot = json.loads(incident.metrics_snapshot) if incident.metrics_snapshot else {}
-        system_metrics = json.loads(incident.system_metrics) if incident.system_metrics else {}
-        
-        # 3. Call LLM agent analysis
-        print(f"[Agent] Running LLaMA-3 analysis on incident '{incident.alert_name}'...")
-        plan = analyze_incident_telemetry(alert_details, metrics_snapshot, system_metrics)
-        
-        # 4. Save analysis summary
-        incident.analysis_summary = plan.get("root_cause_analysis", "")
-        db.add(IncidentTimeline(
-            incident_id=incident.id,
-            event_type="analysis_complete",
-            description=f"AI Agentic analysis completed. Root cause: {incident.analysis_summary[:100]}..."
-        ))
-        db.commit()
-        
-        # 5. Dynamic Routing Logic
-        confidence = plan.get("confidence_score", 100)
-        recent_deploys = system_metrics.get("recent_deployments", [])
-        
-        print(f"[Agent] Confidence: {confidence}%. Recent deploys count: {len(recent_deploys)}")
-        
-        if confidence < 80 or not recent_deploys:
-            # PATH A: LOW CONFIDENCE / MISSING CONTEXT -> DIAGNOSTIC ESCALATION
-            incident.status = "needs_manual_diagnosis"
-            missing_details = plan.get("missing_context_details", "No deploy history matched in pre-alert window.")
-            db.add(IncidentTimeline(
-                incident_id=incident.id,
-                event_type="routed_to_diagnostic",
-                description=f"Confidence: {confidence}%. Missing context: {missing_details}. Routed to SRE diagnostic queue."
-            ))
-            db.commit()
-            print(f"[Agent] Incident {incident_id} routed to manual SRE diagnostic queue.")
-        else:
-            # PATH B: HIGH CONFIDENCE -> AUTO-REMEDIATION EXECUTION ROUTE
-            incident.status = "analyzed"
-            db.commit()
-            execute_remediation_plan(incident, plan, db)
-            
+        compiled_graph.invoke(initial_state)
+        print(f"[Agent Graph] Workflow completed successfully.")
     except Exception as e:
-        db.rollback()
-        print(f"[Agent] [ERROR] Failed during agent run: {e}")
-    finally:
-        db.close()
-
-def execute_remediation_plan(incident, plan, db):
-    proposed_actions = plan.get("proposed_actions", [])
-    if not proposed_actions:
-        incident.status = "resolved"
-        incident.ends_at = datetime.utcnow()
-        db.add(IncidentTimeline(
-            incident_id=incident.id,
-            event_type="resolved",
-            description="Incident marked as resolved automatically (no remediation actions proposed)."
-        ))
-        db.commit()
-        generate_postmortem(incident.id)
-        return
-        
-    has_risky_actions = False
-    
-    for action in proposed_actions:
-        action_type = action.get("action_type", "unknown")
-        risk_level = action.get("risk_level", "safe")
-        details = action.get("details", "")
-        
-        db_action = RemediationAction(
-            incident_id=incident.id,
-            action_type=action_type,
-            risk_level=risk_level,
-            details=details
-        )
-        
-        if risk_level == "safe":
-            # Safe action: Auto-execute
-            db_action.status = "executing"
-            db.add(db_action)
-            db.commit()
-            
-            db.add(IncidentTimeline(
-                incident_id=incident.id,
-                event_type="action_proposed",
-                description=f"Proposed safe action '{action_type}': {details}"
-            ))
-            db.commit()
-            
-            output = run_mock_remediation(action_type)
-            db_action.execution_output = output
-            db_action.status = "executed"
-            
-            db.add(IncidentTimeline(
-                incident_id=incident.id,
-                event_type="action_executed",
-                description=f"Auto-executed safe remediation action: '{action_type}'"
-            ))
-            db.commit()
-        else:
-            # Risky action: Requires approval
-            has_risky_actions = True
-            db_action.status = "pending_approval"
-            db.add(db_action)
-            db.commit()
-            
-            db.add(IncidentTimeline(
-                incident_id=incident.id,
-                event_type="action_proposed",
-                description=f"Proposed risky action '{action_type}' (requires SRE approval): {details}"
-            ))
-            db.commit()
-            
-    if has_risky_actions:
-        incident.status = "awaiting_approval"
-        db.add(IncidentTimeline(
-            incident_id=incident.id,
-            event_type="awaiting_operator_approval",
-            description="One or more risky remediation actions require manual Operator approval."
-        ))
-        db.commit()
-        print(f"[Agent] Incident {incident.id} is awaiting operator approval for risky actions.")
-    else:
-        # Only safe actions executed, resolve the incident
-        incident.status = "resolved"
-        incident.ends_at = datetime.utcnow()
-        db.add(IncidentTimeline(
-            incident_id=incident.id,
-            event_type="resolved",
-            description="Incident resolved automatically after executing all safe remediation actions."
-        ))
-        db.commit()
-        print(f"[Agent] Incident {incident.id} resolved successfully.")
-        generate_postmortem(incident.id)
+        print(f"[Agent Graph] [CRITICAL ERROR] Graph execution failed: {e}")
 
 def run_mock_remediation(action_type: str) -> str:
     import time
     print(f"[Remediation] Running SRE action '{action_type}'...")
-    time.sleep(1) # Simulate the operation lag
+    time.sleep(1) # Simulate operation lag
     
     if action_type == "clear_cache":
         try:
             from demo_app.app import memory_hog
             memory_hog.clear()
-            MEMORY_USAGE.set(10 * 1024 * 1024) # set memory usage to healthy baseline (e.g. 10MB)
+            MEMORY_USAGE.set(10 * 1024 * 1024) # set memory usage to healthy baseline (10MB)
         except Exception as e:
             print(f"[Remediation] [Warning] Failed to clear memory hog: {e}")
         return "Cache memory storage cleared. Wiped active RAM footprint."
@@ -224,6 +389,7 @@ def run_mock_remediation(action_type: str) -> str:
     return f"Remediation mock for '{action_type}' finished."
 
 def execute_sensitive_remediation(action_id: str):
+    """Executes a staged risky action upon Operator approval, then resumes postmortem loop."""
     db = SessionLocal()
     try:
         action = db.query(RemediationAction).filter(RemediationAction.id == action_id).first()
@@ -231,7 +397,7 @@ def execute_sensitive_remediation(action_id: str):
             print(f"[Remediation] Action ID {action_id} not found.")
             return
         
-        # 1. Update status to executing
+        # 1. Update action status to executing
         action.status = "executing"
         db.commit()
         
@@ -248,26 +414,30 @@ def execute_sensitive_remediation(action_id: str):
         ))
         db.commit()
         
-        # 4. Check if there are other pending_approval/executing actions for this incident
+        # 4. Check if there are other pending/executing actions left
         remaining_pending = db.query(RemediationAction).filter(
             RemediationAction.incident_id == action.incident_id,
             RemediationAction.status.in_(["pending_approval", "executing"])
         ).first()
         
         if not remaining_pending:
-            # All actions completed, mark incident as resolved
-            incident = db.query(Incident).filter(Incident.id == action.incident_id).first()
-            if incident and incident.status != "resolved":
-                incident.status = "resolved"
-                incident.ends_at = datetime.utcnow()
-                db.add(IncidentTimeline(
-                    incident_id=incident.id,
-                    event_type="resolved",
-                    description="Incident resolved successfully after executing SRE-approved remediation actions."
-                ))
-                db.commit()
-                print(f"[Remediation] Incident {incident.id} is now resolved.")
-                generate_postmortem(incident.id)
+            # Trigger the resolve and postmortem node to close loop
+            print(f"[Remediation] All actions completed for {action.incident_id}. Handing over to resolve node...")
+            state = {
+                "incident_id": action.incident_id,
+                "alert_name": "",
+                "severity": "",
+                "starts_at": "",
+                "metrics_snapshot": {},
+                "system_metrics": {},
+                "analysis_summary": "",
+                "confidence_score": 100,
+                "missing_context_details": "",
+                "proposed_actions": [],
+                "db_status": "analyzed"
+            }
+            resolve_and_postmortem_node(state)
+            
     except Exception as e:
         db.rollback()
         print(f"[Remediation] [ERROR] Failed to execute sensitive remediation: {e}")
